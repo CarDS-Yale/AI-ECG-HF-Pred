@@ -1,0 +1,863 @@
+
+Libraries
+
+```{r, include=FALSE}
+library(tidyverse)
+library(dplyr)
+library(table1)
+library(Hmisc)
+library(aod)
+library(pROC)
+library(forestplot)
+library(survival)
+library(survminer)
+```
+
+
+Survival Analysis
+```{r}
+
+
+yale_path <- "/path_to_yale/yale_df_processed.csv"
+
+
+df_yale <- read.csv(yale_path)
+
+# Choose these values!
+
+threshold <- 0.08
+
+df_yale$pred_col <- df_yale$preds_1lead_march31
+
+df_yale$outcome <- df_yale$PrimaryHF_after_inclusion
+
+df_yale$Time2Outcome <- df_yale$time_to_PrimaryHF
+
+# Exclude those with previous HF and those in train df 
+
+df_yale <- df_yale[df_yale$ECG_during_inpatient_visit != 'True', ]
+
+df_yale <- df_yale[df_yale$MRN_in_trainDF_single_lead_model_BEFORE_PROC != 'True', ]
+
+
+
+df_yale <- df_yale[df_yale$AnyHF_before_inclusion == 0, ]
+
+df_yale <- df_yale[df_yale$AnyEchoLVDD_or_AnyEchoUnder50_Before_ECG != 'True', ]
+
+df_yale <- df_yale %>%
+  filter(is.na(Highest_BNP_before_ECG) | Highest_BNP_before_ECG < 300)
+
+
+```
+
+```{r}
+
+df_yale$age <- df_yale$Age_at_ECG
+df_yale$sex <- ifelse(df_yale$SEX == "Male", 1, 0)
+
+# Convert ECGDate and DEATH_DATE to datetime objects
+df_yale$ECGDate <- as.Date(df_yale$ECGDate)
+df_yale$DEATH_DATE <- as.Date(df_yale$DEATH_DATE)
+
+# Calculate time_to_death
+df_yale$time_to_death <- as.numeric(difftime(df_yale$DEATH_DATE, df_yale$ECGDate, units = "days"))
+df_yale$time_to_death[is.na(df_yale$DEATH_DATE)] <- NA
+
+
+df_yale <- df_yale %>%
+  mutate(Age_65_YN = case_when(
+    Age_at_ECG < 65 ~ "< 65",
+    Age_at_ECG >= 65 ~ "≥ 65",
+    TRUE ~ NA_character_
+  ))
+
+
+df_yale$pcp_hf_risk_adjusted <- (df_yale$pcp_hf_risk * df_yale$time_to_censor) / 3650
+
+df_yale$positive_screen <- df_yale$pred_col>=threshold
+
+df_yale$obesity <- ifelse(df_yale$bmi < 30 | is.na(df_yale$bmi), FALSE, TRUE)
+
+df_yale <- df_yale %>%
+  mutate(
+    pred_strata_custom3 = case_when(
+      pred_col >= 0 & pred_col < 0.2 ~ "0-0.2",
+      pred_col >= 0.2 & pred_col < 0.4 ~ "0.2-0.4",
+      pred_col >= 0.4 & pred_col < 0.6 ~ "0.4-0.6",
+      pred_col >= 0.6 & pred_col < 0.8 ~ "0.6-0.8",
+      pred_col >= 0.8 & pred_col < 1 ~ "0.8-1",
+      TRUE ~ NA_character_  # This line handles cases outside the specified ranges, if any
+    )
+  )
+
+
+
+df_yale$AnyHF_or_death <- as.integer(df_yale$AnyHF_after_inclusion == 1 | df_yale$death == 1)
+
+df_yale$time_to_AnyHF_or_death <- with(df_yale, pmin(time_to_AnyHF, time_to_death, na.rm = TRUE))
+
+df_yale$PrimaryHF_or_death <- as.integer(df_yale$PrimaryHF_after_inclusion == 1 | df_yale$death == 1)
+
+df_yale$time_to_PrimaryHF_or_death <- with(df_yale, pmin(time_to_PrimaryHF, time_to_death, na.rm = TRUE))
+
+df_yale_backup <- df_yale
+
+```
+
+```{r}
+# Extract multiple HRs using single function
+
+library(survival)
+library(broom)
+
+fit_and_extract <- function(time_var, event_var, covariate_formula, data) {
+  # Prepare the survival object with dynamic event and time-to-event variables
+  surv_obj <- Surv(time = data[[time_var]], event = data[[event_var]])
+  
+  # Construct the full model formula dynamically
+  full_formula <- as.formula(paste("surv_obj ~", covariate_formula))
+  
+  # Fit the Cox model
+  cox_model <- coxph(full_formula, data = data)
+  
+  # Use broom to tidy the model and extract the necessary components
+  tidy_cox <- tidy(cox_model)
+  
+  # Check for the presence of the confidence interval columns
+  if (!("conf.low" %in% names(tidy_cox)) || !("conf.high" %in% names(tidy_cox))) {
+    # If the CI columns aren't present, use the confint function to get them
+    ci <- confint(cox_model)
+    tidy_cox$conf.low <- ci[,1]
+    tidy_cox$conf.high <- ci[,2]
+  }
+  
+  # Exponentiate the coefficients to get the hazard ratios
+  tidy_cox$HR <- exp(tidy_cox$estimate)
+  tidy_cox$CI_low <- exp(tidy_cox$conf.low)
+  tidy_cox$CI_high <- exp(tidy_cox$conf.high)
+  
+  # Create a formatted HR (95% CI) column
+  tidy_cox$HR_95CI <- paste0(round(tidy_cox$HR, 2), " (", round(tidy_cox$CI_low, 2), "-", round(tidy_cox$CI_high, 2), ")")
+  
+  # Create a formatted HR (95% CI) words column
+  tidy_cox$HR_95CI_words <- paste0("(HR " , round(tidy_cox$HR, 2), " [95% CI, ", round(tidy_cox$CI_low, 2), "-", round(tidy_cox$CI_high, 2), "])")
+  
+  # Select the necessary columns to return
+  results <- tidy_cox[, c("term", "HR_95CI", "HR_95CI_words")]
+  colnames(results) <- c("Covariate", "HR_95CI", "HR_95CI_words") # Rename for clarity
+  
+  return(results)
+}
+
+
+# Initialize an empty data frame for results
+results_table <- data.frame(Event = character(), Model = character(),  Covariate = character(), HR_95CI = character(), HR_95CI_words = character(),  stringsAsFactors = FALSE)
+
+# Define your models and their corresponding event and time variables
+models <- list(
+  list(event_var = "PrimaryHF_after_inclusion", time_var = "time_to_PrimaryHF", covariates = "positive_screen", label = "Baseline"),
+  list(event_var = "PrimaryHF_after_inclusion", time_var = "time_to_PrimaryHF", covariates = "positive_screen + age + sex", label = "Age + Sex"),
+  
+  list(event_var = "PrimaryHF_after_inclusion", time_var = "time_to_PrimaryHF", covariates = "positive_screen + age + sex + AnyT2DM_before_inclusion + AnyHTN_before_inclusion + AnyIHD_before_inclusion + obesity", label = "Age + Sex + T2DM + HTN + IHD + Obesity"),
+
+  list(event_var = "PrimaryHF_after_inclusion", time_var = "time_to_PrimaryHF", covariates = "pred_strata_custom3 + age + sex", label = "Age + Sex"),
+    
+  list(event_var = "PrimaryHF_or_EchoUnder50", time_var = "time_to_PrimaryHF_or_EchoUnder50", covariates = "positive_screen + age + sex", label = "Age + Sex"),
+  
+  list(event_var = "PrimaryHF_or_death", time_var = "time_to_PrimaryHF_or_death", covariates = "positive_screen + age + sex", label = "Age + Sex"),
+  
+  list(event_var = "PrimaryAMI_after_inclusion", time_var = "time_to_PrimaryAMI", covariates = "positive_screen + age + sex", label = "Age + Sex"),
+  list(event_var = "PrimarySTROKE_after_inclusion", time_var = "time_to_PrimarySTROKE", covariates = "positive_screen + age + sex", label = "Age + Sex"),
+  list(event_var = "death", time_var = "time_to_death", covariates = "positive_screen + age + sex", label = "Age + Sex"),
+  list(event_var = "PrimaryMACE4", time_var = "time_to_PrimaryMACE4", covariates = "positive_screen + age + sex", label = "Age + Sex"),
+  list(event_var = "AnyHF_after_inclusion", time_var = "time_to_AnyHF", covariates = "positive_screen + age + sex", label = "Age + Sex"),
+  list(event_var = "AnyHF_or_EchoUnder50", time_var = "time_to_AnyHF_or_EchoUnder50", covariates = "positive_screen + age + sex", label = "Age + Sex"),
+  
+  list(event_var = "AnyHF_or_death", time_var = "time_to_AnyHF_or_death", covariates = "positive_screen + age + sex", label = "Age + Sex"),
+  
+  list(event_var = "PrimaryHF_after_inclusion", time_var = "time_to_PrimaryHF", covariates = "pred_col_x10", label = "Per 0.1 Increase"),
+  list(event_var = "PrimaryHF_after_inclusion", time_var = "time_to_PrimaryHF", covariates = "pred_col_x10 + age + sex", label = "Per 0.1 Increase (Age + Sex)"),
+  list(event_var = "PrimaryHF_after_inclusion", time_var = "time_to_PrimaryHF", covariates = "pred_col_x10 + age + sex + AnyT2DM_before_inclusion + AnyHTN_before_inclusion + AnyIHD_before_inclusion + obesity", label = "Per 0.1 Increase (Age + Sex + T2DM + HTN + IHD + Obesity)")
+  
+)
+
+
+
+# Loop through each model specification and add results to the table
+for (model in models) {
+  model_results <- fit_and_extract(model$time_var, model$event_var, model$covariates, df_yale)
+  # Append each covariate's result to the results_table
+  for (row in 1:nrow(model_results)) {
+    results_table <- rbind(results_table, data.frame(
+      Event = model$event_var, 
+      Model = model$label, 
+      Covariate = model_results$Covariate[row],
+      HR_95CI = model_results$HR_95CI[row],
+      HR_95CI_words = model_results$HR_95CI_words[row]
+      
+    ))
+  }
+}
+
+# Print the results table
+print(results_table)
+
+write.csv(results_table, file = "yale_1_lead_signal_results.csv", row.names = FALSE)
+
+```
+
+```{r}
+
+# Get unique categories in Clean_InstitutionName
+results_table_sites <- data.frame(Event = character(), Model = character(), Institution = character(), Covariate = character(), HR_95CI = character(), HR_95CI_words = character(), stringsAsFactors = FALSE)
+
+unique_institutions <- unique(df_yale$Clean_InstitutionName)
+
+# Loop through each institution category
+for (institution in unique_institutions) {
+  # Subset the data frame for the current institution
+  df_yale_subset <- df_yale[df_yale$Clean_InstitutionName == institution, ]
+  
+  # Loop through each model specification and process the subset
+  for (model in models) {
+    model_results <- fit_and_extract(model$time_var, model$event_var, model$covariates, df_yale_subset)
+    
+    # Append each covariate's result to the results_table_sites
+    for (row in 1:nrow(model_results)) {
+      results_table_sites <- rbind(results_table_sites, data.frame(
+        Event = model$event_var, 
+        Model = model$label,
+        Institution = institution,
+        Covariate = model_results$Covariate[row],
+        HR_95CI = model_results$HR_95CI[row],
+        HR_95CI_words = model_results$HR_95CI_words[row]
+      ))
+    }
+  }
+}
+
+# Print and save the results table
+
+write.csv(results_table_sites, file = "yale_SITES_1_lead_signal_results.csv", row.names = FALSE)
+
+
+```
+
+
+```{r}
+
+# # Competing risk 
+library(cmprsk)
+
+df_yale$multioutcome <- ifelse(df_yale$outcome == 1, 1,
+                            ifelse(df_yale$death == 1, 2, 0))
+
+df_yale_predictors_cont <- c("positive_screen","age", "sex")
+
+covariate_matrix <- as.matrix(df_yale[df_yale_predictors_cont])
+
+# # Fit the Fine-Gray model
+
+fg_model <- crr(ftime = df_yale$time_to_PrimaryHF, fstatus = df_yale$multioutcome, cov1 = covariate_matrix, variance = TRUE)
+summary(fg_model)
+
+df_yale$multioutcome <- ifelse(df_yale$outcome == 1, 1,
+                            ifelse(df_yale$death == 1, 2, 0))
+
+df_yale_predictors_cont <- c("positive_screen","age", "sex", "AnyT2DM_before_inclusion", "AnyHTN_before_inclusion", "AnyIHD_before_inclusion" , "obesity")
+
+covariate_matrix <- as.matrix(df_yale[df_yale_predictors_cont])
+
+# # Fit the Fine-Gray model
+
+fg_model <- crr(ftime = df_yale$time_to_PrimaryHF, fstatus = df_yale$multioutcome, cov1 = covariate_matrix, variance = TRUE)
+summary(fg_model)
+
+
+# Continuous Risk
+
+df_yale$multioutcome <- ifelse(df_yale$outcome == 1, 1,
+                            ifelse(df_yale$death == 1, 2, 0))
+
+df_yale_predictors_cont <- c("pred_col_x10","age", "sex")
+
+covariate_matrix <- as.matrix(df_yale[df_yale_predictors_cont])
+
+# # Fit the Fine-Gray model
+
+fg_model <- crr(ftime = df_yale$time_to_PrimaryHF, fstatus = df_yale$multioutcome, cov1 = covariate_matrix, variance = TRUE)
+summary(fg_model)
+
+
+df_yale$multioutcome <- ifelse(df_yale$outcome == 1, 1,
+                            ifelse(df_yale$death == 1, 2, 0))
+
+df_yale_predictors_cont <- c("pred_col_x10","age", "sex", "AnyT2DM_before_inclusion", "AnyHTN_before_inclusion",  "AnyIHD_before_inclusion" , "obesity")
+
+covariate_matrix <- as.matrix(df_yale[df_yale_predictors_cont])
+
+# # Fit the Fine-Gray model
+
+fg_model <- crr(ftime = df_yale$time_to_PrimaryHF, fstatus = df_yale$multioutcome, cov1 = covariate_matrix, variance = TRUE)
+summary(fg_model)
+
+
+```
+
+# NOTE Cleaned till here
+
+
+```{r}
+library(survminer)
+
+cox_model <- coxph(Surv(Time2Outcome, outcome) ~ age + sex + strata(positive_screen),
+                   data = df_yale)
+
+hazard_est <- basehaz(cox_model)
+
+hazard_plot_positive_screen <- ggsurvplot(survfit(cox_model),
+                    data = df_yale, 
+                    fun = "cumhaz", # Specify that you want to plot the cumulative hazard
+           risk.table = TRUE, conf.int = FALSE,
+           ylab="Cumulative Hazard", xlab="Follow-up Time (days)",
+           size=1, risk.table.y.text = FALSE, palette = 
+    c( "#0072B2", "#FF8C00"), ggtheme = theme(
+             axis.text.x = element_text(size=18, vjust = 0.5, colour = "#000000"),
+          axis.text.y = element_text(size=18, vjust = 0.5, colour = "#000000"),
+          axis.title.y = element_text(size=18, face="bold", colour = "#000000"),
+          axis.title.x = element_text(size=18, face="bold", colour = "#000000"),
+             axis.line.x = element_line(colour = "#000000"),
+          axis.line.y = element_line(colour = "#000000"),
+             panel.background = element_rect(fill='transparent'),
+          plot.background = element_rect(fill='transparent', color=NA),
+        
+          legend.title=element_text(size=18),
+          legend.position="bottom",
+          legend.text=element_text(size=18)),
+    title = "Adjusted for Age and Sex"
+            
+           ) 
+
+hazard_plot_positive_screen
+
+```
+
+
+```{r}
+
+
+library(survminer)
+
+cox_model <- coxph(Surv(Time2Outcome, outcome) ~ age + sex + strata(pred_strata_custom),
+                   data = df_yale)
+
+hazard_est <- basehaz(cox_model)
+
+hazard_plot_custom_strata <- ggsurvplot(survfit(cox_model),
+                    data = df_yale, 
+                    fun = "cumhaz", # Specify that you want to plot the cumulative hazard
+                      # ylim = c(0, 0.0050),  # Adjust the y-axis limits as needed
+           risk.table = TRUE, conf.int = FALSE,
+           ylab="Cumulative Hazard", xlab="Follow-up Time (days)",
+           size=1, risk.table.y.text = FALSE, palette = 
+    c( "#1FD068", "#FFD700", "#7D0108"), ggtheme = theme(
+             axis.text.x = element_text(size=18, vjust = 0.5, colour = "#000000"),
+          axis.text.y = element_text(size=18, vjust = 0.5, colour = "#000000"),
+          axis.title.y = element_text(size=18, face="bold", colour = "#000000"),
+          axis.title.x = element_text(size=18, face="bold", colour = "#000000"),
+             axis.line.x = element_line(colour = "#000000"),
+          axis.line.y = element_line(colour = "#000000"),
+             panel.background = element_rect(fill='transparent'),
+          plot.background = element_rect(fill='transparent', color=NA),
+        
+          legend.title=element_text(size=18),
+          legend.position="bottom",
+          legend.text=element_text(size=18)),
+    title = "Adjusted for Age and Sex"
+            
+           ) 
+
+hazard_plot_custom_strata
+
+```
+
+
+
+
+```{r}
+
+
+# Adjusted function to handle different subgroups based on categorical variables
+fit_and_extract_subgroups <- function(time_var, event_var, covariate_formula, categorical_vars, data) {
+  results_subgroups_HR <- data.frame(Event = character(), Model = character(), Covariate = character(), HR_95CI = character(), HR_95CI_words = character(), stringsAsFactors = FALSE)
+  
+  for (var in categorical_vars) {
+    unique_values <- unique(data[[var]])
+    for (value in unique_values) {
+      subgroup_data <- subset(data, data[[var]] == value)
+      covariate_formula_with_subgroup <- paste(covariate_formula, collapse = " + ")
+      model_results <- fit_and_extract(time_var, event_var, covariate_formula_with_subgroup, subgroup_data)
+      
+      for (row in 1:nrow(model_results)) {
+        results_subgroups_HR <- rbind(results_subgroups_HR, data.frame(
+          Event = event_var, 
+          Model = paste(var, value, sep = "_"), 
+          Covariate = model_results$Covariate[row],
+          HR_95CI = model_results$HR_95CI[row],
+          HR_95CI_words = model_results$HR_95CI_words[row]
+        ))
+      }
+    }
+  }
+  return(results_subgroups_HR)
+}
+
+# Define your categorical variables
+categorical_vars <- c("Age_65_YN", "SEX", "race_ethnicity_demographics")
+
+# Define your models and their corresponding event and time variables
+models <- list(
+    list(event_var = "PrimaryHF_after_inclusion", time_var = "time_to_PrimaryHF", covariates = c("positive_screen", "age", "sex"), label = "Age + Sex")
+  
+)
+
+# Initialize an empty data frame for results
+results_subgroups_HR <- data.frame(Event = character(), Model = character(),  Covariate = character(), HR_95CI = character(), HR_95CI_words = character(),  stringsAsFactors = FALSE)
+
+# Loop through each model specification and add results to the table
+for (model in models) {
+  model_results <- fit_and_extract_subgroups(model$time_var, model$event_var, model$covariates, categorical_vars, df_yale)
+  results_subgroups_HR <- rbind(results_subgroups_HR, model_results)
+}
+
+# Print the results table
+print(results_subgroups_HR)
+
+
+```
+
+
+
+```{r}
+
+# Define your categorical variables
+categorical_vars <- c("Age_65_YN", "SEX", "race_ethnicity_demographics")
+
+# Initialize an empty data frame for results
+results_subgroups_counts <- data.frame(Category = character(), Count_PrimaryHF_1 = numeric(), stringsAsFactors = FALSE)
+
+# Loop through each categorical variable
+for (var in categorical_vars) {
+  unique_values <- unique(df_yale[[var]])
+  for (value in unique_values) {
+    subgroup_data <- subset(df_yale, df_yale[[var]] == value)
+    count_primaryHF_1 <- sum(subgroup_data$PrimaryHF_after_inclusion == 1, na.rm = TRUE)
+    
+    results_subgroups_counts <- rbind(results_subgroups_counts, data.frame(
+      Category = paste(var, value, sep = "_"),
+      Count_PrimaryHF_1 = count_primaryHF_1
+    ))
+  }
+}
+
+# Print the results table
+print(results_subgroups_counts)
+
+
+```
+
+
+```{r}
+
+extract_harrells_c <- function(cox_model) {
+  # Extract the concordance index and its standard error
+  concordance <- cox_model$ concordance[1]
+  se_concordance <- cox_model$ concordance[2]
+  
+  # Calculate the 95% CI using the normal approximation
+  lower_ci <- concordance - 1.96 * se_concordance
+  upper_ci <- concordance + 1.96 * se_concordance
+  
+  # Format the output as requested
+  formatted_output <- sprintf("%.3f (%.3f-%.3f)", concordance, lower_ci, upper_ci)
+  
+  return(formatted_output)
+}
+
+
+calculate_difference_and_CI <- function(compareC_result) {
+  # Extract the necessary values
+  diff_c <- compareC_result$est.diff_c
+  var_diff_c <- compareC_result$est.vardiff_c
+  
+  # Z-score for 95% CI (1.96 for a two-tailed test)
+  z_score <- qnorm(0.975) # This will give 1.96
+  
+  # Calculate the standard error
+  std_error <- sqrt(var_diff_c)
+  
+  # Calculate the 95% confidence interval
+  lower_ci <- diff_c - z_score * std_error
+  upper_ci <- diff_c + z_score * std_error
+  
+  # Create a list to return the results
+  result <- list(
+    difference = diff_c,
+    lower_CI = lower_ci,
+    upper_CI = upper_ci
+  )
+  
+  return(result)
+}
+
+
+```
+
+```{r}
+calculate_c_statistics <- function(output) {
+  # Extract and adjust the C indices
+  c_index_1 <- 1 - output$est.c[1]
+  c_index_2 <- 1 - output$est.c[2]
+  
+  # Calculate 95% CIs for the adjusted C indices
+  ci_c_index_1 <- c(1 - (output$est.c[1] + 1.96 * sqrt(output$est.varCxy)),
+                    1 - (output$est.c[1] - 1.96 * sqrt(output$est.varCxy)))
+  
+  ci_c_index_2 <- c(1 - (output$est.c[2] + 1.96 * sqrt(output$est.varCxz)),
+                    1 - (output$est.c[2] - 1.96 * sqrt(output$est.varCxz)))
+  
+ # Extract the difference in the C indices
+  diff_c_indices <- output$est.diff_c
+  
+  # Calculate the 95% CI for the difference
+  ci_diff_c_indices <- c(diff_c_indices - 1.96 * sqrt(output$est.vardiff_c),
+                         diff_c_indices + 1.96 * sqrt(output$est.vardiff_c))
+  
+  # Extract the p-value for the difference
+  p_value <- output$pval
+  
+  # Return a list containing all the results
+  list(c_index_1 = c_index_1, ci_c_index_1 = ci_c_index_1,
+       c_index_2 = c_index_2, ci_c_index_2 = ci_c_index_2,
+       diff_c_indices = diff_c_indices, ci_diff_c_indices = ci_diff_c_indices,
+       p_value = p_value)
+}
+
+# Assuming 'output' is the list shown in the screenshot
+# result <- calculate_c_statistics(output)
+# print(result)
+
+
+```
+
+```{r}
+library(compareC)
+
+cox_model_pred <- coxph(Surv(Time2Outcome, outcome) ~ pred_col, data = df_yale)
+summary(cox_model_pred)
+
+
+cox_model_pcp <- coxph(Surv(Time2Outcome, outcome) ~ pcp_hf_risk_adjusted, data = df_yale)
+summary(cox_model_pcp)
+
+
+cox_model_prevent <- coxph(Surv(Time2Outcome, outcome) ~ prevent_hf_risk_adjusted, data = df_yale)
+summary(cox_model_prevent)
+
+
+cox_model_pred_age_sex <- coxph(Surv(Time2Outcome, outcome) ~ pred_col + age + sex, data = df_yale)
+summary(cox_model_pred_age_sex)
+
+
+cox_model_both <- coxph(Surv(Time2Outcome, outcome) ~ pred_col + pcp_hf_risk_adjusted, data = df_yale)
+summary(cox_model_both)
+
+cox_model_both_ai_prevent <- coxph(Surv(Time2Outcome, outcome) ~ pred_col + prevent_hf_risk_adjusted, data = df_yale)
+summary(cox_model_both_ai_prevent)
+
+
+df_yale$hr_pred <- predict(cox_model_pred, type="risk", newdata =df_yale)
+df_yale$hr_pcp <- predict(cox_model_pcp, type="risk", newdata =df_yale)
+df_yale$hr_prevent <- predict(cox_model_prevent, type="risk", newdata =df_yale)
+df_yale$hr_pred_age_sex <- predict(cox_model_pred_age_sex, type="risk", newdata =df_yale)
+df_yale$hr_both <- predict(cox_model_both, type="risk", newdata =df_yale)
+df_yale$hr_both_ai_prevent <- predict(cox_model_both_ai_prevent, type="risk", newdata =df_yale)
+
+df_yale2 <- subset(df_yale, select = c(age, Time2Outcome, outcome, pred_col, pcp_hf_risk_adjusted, hr_pred, hr_pcp, hr_both, hr_pred_age_sex))
+df_yale2 <- subset(df_yale2, age >= 30 & age <= 80)
+df_yale2 <- df_yale2[is.finite(rowSums(df_yale2)), ]  # Remove rows with Inf values
+
+df_yale3 <- subset(df_yale, select = c(age, Time2Outcome, outcome, pred_col, prevent_hf_risk_adjusted, hr_pred, hr_prevent, hr_pred_age_sex, hr_both_ai_prevent))
+df_yale3 <- subset(df_yale3, age >= 30 & age <= 80)
+df_yale3 <- df_yale3[is.finite(rowSums(df_yale3)), ]  # Remove rows with Inf values
+
+
+# PCP
+pred_vs_pcp <- compareC(df_yale2$Time2Outcome, df_yale2$outcome, df_yale2$hr_pred, df_yale2$hr_pcp)
+calculate_c_statistics(pred_vs_pcp)
+
+
+pred_age_sex_vs_pcp <- compareC(df_yale2$Time2Outcome, df_yale2$outcome, df_yale2$hr_pred_age_sex, df_yale2$hr_pcp)
+calculate_c_statistics(pred_age_sex_vs_pcp)
+
+
+both_vs_pcp <- compareC(df_yale2$Time2Outcome, df_yale2$outcome, df_yale2$hr_both, df_yale2$hr_pcp)
+calculate_c_statistics(both_vs_pcp)
+
+
+# PREVENT
+pred_vs_prevent <- compareC(df_yale3$Time2Outcome, df_yale3$outcome, df_yale3$hr_pred, df_yale3$hr_prevent)
+calculate_c_statistics(pred_vs_prevent)
+
+pred_age_sex_vs_prevent <- compareC(df_yale3$Time2Outcome, df_yale3$outcome, df_yale3$hr_pred_age_sex, df_yale3$hr_prevent)
+calculate_c_statistics(pred_age_sex_vs_prevent)
+
+both_vs_prevent <- compareC(df_yale3$Time2Outcome, df_yale3$outcome, df_yale3$hr_both_ai_prevent, df_yale3$hr_prevent)
+calculate_c_statistics(both_vs_prevent)
+
+
+
+
+```
+
+
+```{r}
+
+library(survminer)
+library(survival)
+
+
+hazard_plot_custom_strata <- ggsurvplot(survfit(cox_model),
+                    data = df_yale, 
+                    fun = "cumhaz", # Specify that you want to plot the cumulative hazard
+                    risk.table = FALSE, # Do not show the risk table
+                    conf.int = FALSE,
+                    ylab="Cumulative Hazard", xlab="Follow-up Time (days)",
+                    size=1, risk.table.y.text = FALSE, 
+                    palette = c("#1FD068", "#FFD700", "#7D0108"), 
+                    legend = 'none', # Do not show the legend
+                    ggtheme = theme(
+                      axis.text.x = element_text(size=18, vjust = 0.5, colour = "#FFFFFF"),
+                      axis.text.y = element_text(size=18, vjust = 0.5, colour = "#FFFFFF"),
+                      axis.title.y = element_text(size=18, face="bold", colour = "#FFFFFF"),
+                      axis.title.x = element_text(size=18, face="bold", colour = "#FFFFFF"),
+                      axis.line.x = element_line(colour = "#FFFFFF"),
+                      axis.line.y = element_line(colour = "#FFFFFF"),
+                      panel.background = element_rect(fill='#000000'),
+                      plot.background = element_rect(fill='#000000', color=NA),
+                      panel.grid.major = element_blank(), # Remove major grid lines
+                      panel.grid.minor = element_blank()  # Remove minor grid lines
+                    ),
+                    title = "Adjusted for Age and Sex"
+           )
+
+hazard_plot_custom_strata
+
+
+
+
+```
+
+```{r}
+
+
+library(survminer)
+library(survival)
+
+cox_model <- coxph(Surv(Time2Outcome, outcome) ~ age + sex + strata(positive_screen), data = df_yale)
+
+hazard_plot_positive_screen <- ggsurvplot(survfit(cox_model),
+                    data = df_yale, 
+                    fun = "cumhaz", # Specify that you want to plot the cumulative hazard
+                    risk.table = FALSE, # Do not show the risk table
+                    conf.int = FALSE,
+                    ylab="Cumulative Hazard", xlab="Follow-up Time (days)",
+                    size=1, risk.table.y.text = FALSE, 
+                    palette = c("#0072B2", "#FF8C00"),
+                    legend = 'none', # Do not show the legend
+                    ylim = c(0, 0.10), # Customize the y-axis limits here
+                    ggtheme = theme(
+                      axis.text.x = element_text(size=18, vjust = 0.5, colour = "#FFFFFF"),
+                      axis.text.y = element_text(size=18, vjust = 0.5, colour = "#FFFFFF"),
+                      axis.title.y = element_text(size=18, face="bold", colour = "#FFFFFF"),
+                      axis.title.x = element_text(size=18, face="bold", colour = "#FFFFFF"),
+                      axis.line.x = element_line(colour = "#FFFFFF"),
+                      axis.line.y = element_line(colour = "#FFFFFF"),
+                      panel.background = element_rect(fill='#000000'),
+                      plot.background = element_rect(fill='#000000', color=NA),
+                      panel.grid.major = element_blank(), # Remove major grid lines
+                      panel.grid.minor = element_blank()  # Remove minor grid lines
+                    ),
+                    title = "Adjusted for Age and Sex"
+           )
+
+hazard_plot_positive_screen
+
+
+```
+
+
+```{r}
+
+
+library(survminer)
+
+cox_model <- coxph(Surv(Time2Outcome, outcome) ~ age + sex + strata(pred_strata_custom),
+                   data = df_yale)
+
+hazard_est <- basehaz(cox_model)
+
+hazard_plot_custom_strata <- ggsurvplot(survfit(cox_model),
+                    data = df_yale, 
+                    fun = "cumhaz", # Specify that you want to plot the cumulative hazard
+                      # ylim = c(0, 0.0050),  # Adjust the y-axis limits as needed
+           risk.table = FALSE, conf.int = FALSE,
+           ylab="Cumulative Hazard", xlab="Follow-up Time (days)",
+           size=1, risk.table.y.text = FALSE, palette = 
+    c( "#1FD068", "#FFD700", "#7D0108"), legend = 'none', # Do not show the legend,
+    ggtheme = theme(
+          axis.text.x = element_text(size=18, vjust = 0.5, colour = "#000000"),
+          axis.text.y = element_text(size=18, vjust = 0.5, colour = "#000000"),
+          axis.title.y = element_text(size=18, face="bold", colour = "#000000"),
+          axis.title.x = element_text(size=18, face="bold", colour = "#000000"),
+          axis.line.x = element_line(colour = "#000000"),
+          axis.line.y = element_line(colour = "#000000"),
+          panel.background = element_rect(fill='transparent'),
+          plot.background = element_rect(fill='transparent', color=NA),
+          panel.grid.major = element_blank(), # Remove major grid lines
+          panel.grid.minor = element_blank()  # Remove minor grid lines
+                  
+           ) )
+
+hazard_plot_custom_strata
+
+
+```
+
+
+```{r}
+# IDI
+library(boot)
+
+# Function to calculate IDI
+calculate_idi <- function(outcome, prob1, prob2) {
+  mean_prob1_events <- mean(prob1[outcome == 1])
+  mean_prob1_non_events <- mean(prob1[outcome == 0])
+  mean_prob2_events <- mean(prob2[outcome == 1])
+  mean_prob2_non_events <- mean(prob2[outcome == 0])
+  idi <- (mean_prob2_events - mean_prob1_events) - (mean_prob2_non_events - mean_prob1_non_events)
+  return(idi)
+}
+
+# Function to perform bootstrap for IDI and calculate CI
+idi_bootstrap <- function(data, outcome_col, model1_col, model2_col, R = 1000) {
+  # Extract relevant data
+  outcomes <- data[[outcome_col]]
+  model1_probs <- data[[model1_col]]
+  model2_probs <- data[[model2_col]]
+  
+  # Calculate IDI for the entire dataset
+  initial_idi <- calculate_idi(outcomes, model1_probs, model2_probs)
+  
+  # Bootstrap function for confidence intervals
+  boot_func <- function(data, indices) {
+    d <- data[indices, ]
+    idi_value <- calculate_idi(d[[outcome_col]], d[[model1_col]], d[[model2_col]])
+    return(idi_value)
+  }
+
+  # Perform the bootstrap
+  results <- boot(data, statistic = boot_func, R = R)
+  
+  # Calculate 95% CI using the 'bca' method
+  idi_ci <- boot.ci(results, type = "perc")
+  
+  # Return both IDI and CI
+  list(IDI = initial_idi, CI = idi_ci)
+}
+
+
+calculate_idi(df_yale2$outcome, df_yale2$pcp_hf_risk_adjusted, df_yale2$pred_col)
+idi_bootstrap(df_yale2, "outcome", "pcp_hf_risk_adjusted", "pred_col", R = 1000)
+
+
+
+calculate_idi(df_yale3$outcome, df_yale3$prevent_hf_risk_adjusted, df_yale3$pred_col)
+idi_bootstrap(df_yale3, "outcome", "prevent_hf_risk_adjusted", "pred_col", R = 1000)
+
+
+# NRI
+library(nricens)
+
+# NRI time-to-event
+set.seed(1)
+nricens(time = df_yale3$Time2Outcome, event = df_yale3$outcome,
+        p.std = df_yale3$prevent_hf_risk_adjusted, p.new = df_yale3$pred_col, t0 = median(df_yale3$Time2Outcome),
+updown = "category", cut = 0.08,
+niter = 1000, alpha = 0.05, msg = TRUE)
+
+set.seed(1)
+nricens(time = df_yale3$Time2Outcome, event = df_yale3$outcome,
+        p.std = df_yale3$prevent_hf_risk_adjusted, p.new = df_yale3$pred_col,
+updown = "diff", cut = 0, t0 = median(df_yale3$Time2Outcome),
+niter = 1000, alpha = 0.05, msg = TRUE)
+
+
+# Censored performance metric
+library(timeROC)
+output <- SeSpPPVNPV(cutpoint=0.08,
+                     T=df_yale3$Time2Outcome,
+                     delta=df_yale3$outcome,
+                     marker=df_yale3$pred_col,
+                     cause=1,
+                     times=median(df_yale3$Time2Outcome),
+                     iid = TRUE)
+
+print("AI-ECG")
+# Sen
+paste0(round(output$TP[[2]]*100, 1), "% (", round((output$TP[[2]] - 1.96*output$inference$vect_se_Se[[2]])*100, 1), "-", round((output$TP[[2]] + 1.96*output$inference$vect_se_Se[[2]])*100, 1), ")")
+# Spe
+paste0(round(output$FP[[2]]*100, 1), "% (", round((output$FP[[2]] - 1.96*output$inference$vect_se_Sp1[[2]])*100, 1), "-", round((output$FP[[2]] + 1.96*output$inference$vect_se_Sp1[[2]])*100, 1), ")")
+# PPV
+paste0(round(output$PPV[[2]]*100, 1), "% (", round((output$PPV[[2]] - 1.96*output$inference$vect_se_PPV[[2]])*100, 1), "-", round((output$PPV[[2]] + 1.96*output$inference$vect_se_PPV[[2]])*100, 1), ")")
+# NPV
+paste0(round(output$NPV[[2]]*100, 1), "% (", round((output$NPV[[2]] - 1.96*output$inference$vect_se_NPV1[[2]])*100, 1), "-", round((output$NPV[[2]] + 1.96*output$inference$vect_se_NPV1[[2]])*100, 1), ")")
+
+
+print("PCP-HF")
+output <- SeSpPPVNPV(cutpoint=0.08,
+                     T=df_yale2$Time2Outcome,
+                     delta=df_yale2$outcome,
+                     marker=df_yale2$pcp_hf_risk_adjusted,
+                     cause=1,
+                     times=median(df_yale2$Time2Outcome),
+                     iid = TRUE)
+# Sen
+paste0(round(output$TP[[2]]*100, 1), "% (", round((output$TP[[2]] - 1.96*output$inference$vect_se_Se[[2]])*100, 1), "-", round((output$TP[[2]] + 1.96*output$inference$vect_se_Se[[2]])*100, 1), ")")
+# Spe
+paste0(round(output$FP[[2]]*100, 1), "% (", round((output$FP[[2]] - 1.96*output$inference$vect_se_Sp1[[2]])*100, 1), "-", round((output$FP[[2]] + 1.96*output$inference$vect_se_Sp1[[2]])*100, 1), ")")
+# PPV
+paste0(round(output$PPV[[2]]*100, 1), "% (", round((output$PPV[[2]] - 1.96*output$inference$vect_se_PPV[[2]])*100, 1), "-", round((output$PPV[[2]] + 1.96*output$inference$vect_se_PPV[[2]])*100, 1), ")")
+# NPV
+paste0(round(output$NPV[[2]]*100, 1), "% (", round((output$NPV[[2]] - 1.96*output$inference$vect_se_NPV1[[2]])*100, 1), "-", round((output$NPV[[2]] + 1.96*output$inference$vect_se_NPV1[[2]])*100, 1), ")")
+
+
+print("PREVENT-HF")
+output <- SeSpPPVNPV(cutpoint=0.08,
+                     T=df_yale3$Time2Outcome,
+                     delta=df_yale3$outcome,
+                     marker=df_yale3$prevent_hf_risk_adjusted,
+                     cause=1,
+                     times=median(df_yale3$Time2Outcome),
+                     iid = TRUE)
+# Sen
+paste0(round(output$TP[[2]]*100, 1), "% (", round((output$TP[[2]] - 1.96*output$inference$vect_se_Se[[2]])*100, 1), "-", round((output$TP[[2]] + 1.96*output$inference$vect_se_Se[[2]])*100, 1), ")")
+# Spe
+paste0(round(output$FP[[2]]*100, 1), "% (", round((output$FP[[2]] - 1.96*output$inference$vect_se_Sp1[[2]])*100, 1), "-", round((output$FP[[2]] + 1.96*output$inference$vect_se_Sp1[[2]])*100, 1), ")")
+# PPV
+paste0(round(output$PPV[[2]]*100, 1), "% (", round((output$PPV[[2]] - 1.96*output$inference$vect_se_PPV[[2]])*100, 1), "-", round((output$PPV[[2]] + 1.96*output$inference$vect_se_PPV[[2]])*100, 1), ")")
+# NPV
+paste0(round(output$NPV[[2]]*100, 1), "% (", round((output$NPV[[2]] - 1.96*output$inference$vect_se_NPV1[[2]])*100, 1), "-", round((output$NPV[[2]] + 1.96*output$inference$vect_se_NPV1[[2]])*100, 1), ")")
+
+```

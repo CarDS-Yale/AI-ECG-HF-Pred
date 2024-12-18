@@ -1,0 +1,1189 @@
+
+Libraries
+
+```{r, include=FALSE}
+library(tidyverse)
+library(dplyr)
+library(table1)
+library(Hmisc)
+library(aod)
+library(pROC)
+library(forestplot)
+library(survival)
+library(survminer)
+```
+
+
+Survival Analysis
+```{r}
+
+
+path <- "/path_to_elsa/elsa_df_processed.csv"
+
+
+df_elsa <- read.csv(path)
+
+# Choose these values!
+
+threshold <- 0.08
+
+df_elsa$pred_col <- df_elsa$preds_1lead_march31
+
+df_elsa$outcome <- df_elsa$hf_event_tmp
+
+df_elsa$Time2Outcome <- df_elsa$time_to_hf_event_tmp
+
+# Exclude those with previous HF 
+df_elsa <- df_elsa %>%
+          filter(prevalent_hf_tmp == 0)
+
+df_elsa <- df_elsa[df_elsa$baseline_lvef > 50 | is.na(df_elsa$baseline_lvef), ]
+
+
+df_elsa <- df_elsa %>%
+  mutate(Age_65_YN = case_when(
+    age < 65 ~ "< 65",
+    age >= 65 ~ "≥ 65",
+    TRUE ~ NA_character_
+  ))
+
+
+df_elsa <- df_elsa %>%
+  mutate(OppositeOutcome = case_when(
+    outcome == 1 ~ 0,
+    outcome == 0 ~ 1,
+    TRUE ~ NA
+  ))
+
+
+
+
+df_elsa <- df_elsa %>%
+  mutate(sex = case_when(
+    sex == 'Female' ~ 0,
+    sex == 'Male' ~ 1,
+    TRUE ~ NA
+  ))
+
+df_elsa$pcp_hf_risk_adjusted <- (df_elsa$pcp_hf_risk * df_elsa$time_to_all_cause_death_old_censor) / 3650
+
+
+```
+
+```{r}
+
+df_elsa$positive_screen <- df_elsa$pred_col>=threshold
+df_elsa$obesity <- ifelse(df_elsa$bmi < 30 | is.na(df_elsa$bmi), FALSE, TRUE)
+
+df_elsa$ihd <- df_elsa$s_frciampreval
+
+# #High vs low pred
+model <- coxph(Surv(Time2Outcome, outcome) ~ age + sex + positive_screen + obesity + ihd,
+                   data = df_elsa)
+summary(model)
+
+
+
+
+```
+
+```{r}
+model <- coxph(Surv(Time2Outcome, outcome) ~ positive_screen,
+                    data = df_elsa)
+summary(model)
+
+df_elsa$pred_col_x10 = df_elsa$pred_col * 10
+
+
+# Calculate the mean and standard deviation of 'pred_col'
+mean_pred <- mean(df_elsa$pred_col)
+sd_pred <- sd(df_elsa$pred_col)
+
+# Define the classification thresholds
+threshold_1_sd_below <- mean_pred - sd_pred
+threshold_1_sd_above <- mean_pred + sd_pred
+
+# Create the new column 'pred_strata_SD' based on classification
+df_elsa <- df_elsa %>%
+  mutate(pred_strata_SD = case_when(
+    pred_col < threshold_1_sd_below ~ "< -1 SD",
+    pred_col >= threshold_1_sd_below & pred_col < mean_pred ~ "0 to -1 SD",
+    pred_col >= mean_pred & pred_col <= threshold_1_sd_above ~ "0 to 1 SD",
+    pred_col > threshold_1_sd_above ~ "> 1 SD",
+    TRUE ~ NA_character_
+  ))
+
+
+df_elsa <- df_elsa %>%
+  mutate(pred_strata_SD_num = case_when(
+    pred_col < threshold_1_sd_below ~ "0",
+    pred_col >= threshold_1_sd_below & pred_col < mean_pred ~ "1",
+    pred_col >= mean_pred & pred_col <= threshold_1_sd_above ~ "2",
+    pred_col > threshold_1_sd_above ~ "3",
+    TRUE ~ NA_character_
+  ))
+
+df_elsa$pred_over_SD <- df_elsa$pred_col / sd_pred
+
+
+
+df_elsa <- df_elsa %>%
+  mutate(
+    pred_strata_custom = case_when(
+      pred_col >= 0 & pred_col < 0.1 ~ "0-0.1",
+      pred_col >= 0.1 & pred_col < 0.5 ~ "0.1-0.5",
+      pred_col >= 0.5 & pred_col <= 1 ~ "0.5-1",
+      TRUE ~ NA_character_  # This line handles cases outside the specified ranges, if any
+    )
+  )
+
+
+df_elsa <- df_elsa %>%
+  mutate(
+    pred_strata_custom2 = case_when(
+      pred_col >= 0 & pred_col < 0.1 ~ "0-0.1",
+      pred_col >= 0.1 & pred_col < 0.3 ~ "0.1-0.3",
+      pred_col >= 0.3 & pred_col < 0.5 ~ "0.3-0.5",
+      pred_col >= 0.5 & pred_col < 0.7 ~ "0.5-0.7",
+      pred_col >= 0.7 & pred_col < 0.9 ~ "0.7-0.9",
+      pred_col >= 0.9 & pred_col <= 1 ~ "0.9-1",
+      TRUE ~ NA_character_  # This line handles cases outside the specified ranges, if any
+    )
+  )
+
+
+df_elsa <- df_elsa %>%
+  mutate(
+    pred_strata_custom3 = case_when(
+      pred_col >= 0 & pred_col < 0.2 ~ "0-0.2",
+      pred_col >= 0.2 & pred_col < 0.4 ~ "0.2-0.4",
+      pred_col >= 0.4 & pred_col < 0.6 ~ "0.4-0.6",
+      pred_col >= 0.6 & pred_col < 0.8 ~ "0.6-0.8",
+      pred_col >= 0.8 & pred_col < 1 ~ "0.8-1",
+      TRUE ~ NA_character_  # This line handles cases outside the specified ranges, if any
+    )
+  )
+
+
+
+
+```
+
+```{r}
+
+cox_model <- coxph(Surv(Time2Outcome, outcome) ~ age + sex + pred_strata_custom3,
+                   data = df_elsa)
+summary(cox_model)
+
+
+```
+
+
+```{r}
+df_elsa <- df_elsa %>%
+  mutate(
+    pred_strata_tertiles = case_when(
+      ntile(pred_col, 3) == 1 ~ "0-33%ile",
+      ntile(pred_col, 3) == 2 ~ "33-67%ile",
+      ntile(pred_col, 3) == 3 ~ "67-100%ile"
+    ),
+    pred_strata_tertiles_num = as.integer(ntile(pred_col, 3)) - 1
+  )
+
+
+df_elsa <- df_elsa %>%
+  mutate(
+    pred_strata_quartiles = case_when(
+      ntile(pred_col, 4) == 1 ~ "0-25%ile",
+      ntile(pred_col, 4) == 2 ~ "25-50%ile",
+      ntile(pred_col, 4) == 3 ~ "50-75%ile",
+      ntile(pred_col, 4) == 4 ~ "75-100%ile"
+    ),
+    pred_strata_quartiles_num = as.integer(ntile(pred_col, 4)) - 1
+  )
+
+
+
+df_elsa <- df_elsa %>%
+  mutate(
+    pred_strata_quintiles = case_when(
+      ntile(pred_col, 5) == 1 ~ "1st",
+      ntile(pred_col, 5) == 2 ~ "2nd",
+      ntile(pred_col, 5) == 3 ~ "3rd",
+      ntile(pred_col, 5) == 4 ~ "4th",
+      ntile(pred_col, 5) == 5 ~ "5th",
+    ),
+    pred_strata_quintiles_num = as.integer(ntile(pred_col, 5)) - 1
+  )
+
+quintile_cox <- coxph(Surv(Time2Outcome, outcome) ~ age + sex + pred_strata_quintiles,
+                   data = df_elsa)
+
+summary(quintile_cox)
+
+
+```
+
+```{r}
+
+df_elsa$hf_or_death <- as.integer(df_elsa$hf_event_tmp == 1 | df_elsa$all_cause_death_old_censor == 1)
+
+df_elsa$time_to_hf_or_death <- with(df_elsa, pmin(time_to_hf_event_tmp, time_to_all_cause_death_old_censor, na.rm = TRUE))
+
+
+
+```
+
+
+
+```{r}
+# Load necessary libraries
+library(survival)
+library(broom)
+
+# Adjusted function to handle different event columns and time-to-event data
+fit_and_extract <- function(time_var, event_var, covariate_formula, data) {
+  # Prepare the survival object with dynamic event and time-to-event variables
+  surv_obj <- Surv(time = data[[time_var]], event = data[[event_var]])
+  
+  # Construct the full model formula dynamically
+  full_formula <- as.formula(paste("surv_obj ~", covariate_formula))
+  
+  # Fit the Cox model
+  cox_model <- coxph(full_formula, data = data)
+  
+  # Use broom to tidy the model and extract the necessary components
+  tidy_cox <- tidy(cox_model)
+  
+  # Check for the presence of the confidence interval columns
+  if (!("conf.low" %in% names(tidy_cox)) || !("conf.high" %in% names(tidy_cox))) {
+    # If the CI columns aren't present, use the confint function to get them
+    ci <- confint(cox_model)
+    tidy_cox$conf.low <- ci[,1]
+    tidy_cox$conf.high <- ci[,2]
+  }
+  
+  # Exponentiate the coefficients to get the hazard ratios
+  tidy_cox$HR <- exp(tidy_cox$estimate)
+  tidy_cox$CI_low <- exp(tidy_cox$conf.low)
+  tidy_cox$CI_high <- exp(tidy_cox$conf.high)
+  
+  # Create a formatted HR (95% CI) column
+  tidy_cox$HR_95CI <- paste0(round(tidy_cox$HR, 2), " (", round(tidy_cox$CI_low, 2), "-", round(tidy_cox$CI_high, 2), ")")
+  
+  # Create a formatted HR (95% CI) words column
+  tidy_cox$HR_95CI_words <- paste0("(HR " , round(tidy_cox$HR, 2), " [95% CI, ", round(tidy_cox$CI_low, 2), "-", round(tidy_cox$CI_high, 2), "])")
+
+  
+  # Select the necessary columns to return
+  results <- tidy_cox[, c("term", "HR_95CI", "HR_95CI_words")]
+  colnames(results) <- c("Covariate", "HR_95CI", "HR_95CI_words") # Rename for clarity
+  
+  return(results)
+}
+
+
+# Initialize an empty data frame for results
+results_table <- data.frame(Event = character(), Model = character(),  Covariate = character(), HR_95CI = character(), HR_95CI_words = character(),  stringsAsFactors = FALSE)
+
+# Define your models and their corresponding event and time variables
+models <- list(
+  list(event_var = "hf_event_tmp", time_var = "time_to_hf_event_tmp", covariates = "positive_screen", label = "Baseline"),
+  list(event_var = "hf_event_tmp", time_var = "time_to_hf_event_tmp", covariates = "positive_screen + age + sex", label = "Age + Sex"),
+  list(event_var = "hf_event_tmp", time_var = "time_to_hf_event_tmp", covariates = "positive_screen + age + sex + t2dm + htn", label = "Age + Sex + T2DM + HTN"),
+  
+  list(event_var = "hf_event_tmp", time_var = "time_to_hf_event_tmp", covariates = "pred_strata_custom3 + age + sex", label = "Age + Sex"),
+  
+  list(event_var = "ami_event", time_var = "time_to_ami_event", covariates = "positive_screen + age + sex", label = "Age + Sex"),
+  list(event_var = "stroke_event", time_var = "time_to_stroke_event", covariates = "positive_screen + age + sex", label = "Age + Sex"),
+  list(event_var = "all_cause_death_old_censor", time_var = "time_to_all_cause_death_old_censor", covariates = "positive_screen + age + sex", label = "Age + Sex"),
+  list(event_var = "MACE", time_var = "time_to_MACE", covariates = "positive_screen + age + sex", label = "Age + Sex"),
+
+  list(event_var = "hf_or_death", time_var = "time_to_hf_or_death", covariates = "positive_screen + age + sex", label = "Age + Sex"),
+  
+  list(event_var = "hf_event_tmp", time_var = "time_to_hf_event_tmp", covariates = "pred_col_x10", label = "Per 0.1 Increase"),
+  list(event_var = "hf_event_tmp", time_var = "time_to_hf_event_tmp", covariates = "pred_col_x10 + age + sex", label = "Per 0.1 Increase (Age + Sex)"),
+  list(event_var = "hf_event_tmp", time_var = "time_to_hf_event_tmp", covariates = "pred_col_x10 + age + sex + t2dm + htn", label = "Per 0.1 Increase (Age + Sex + T2DM + HTN)")
+  
+)
+
+
+
+# Loop through each model specification and add results to the table
+for (model in models) {
+  model_results <- fit_and_extract(model$time_var, model$event_var, model$covariates, df_elsa)
+  # Append each covariate's result to the results_table
+  for (row in 1:nrow(model_results)) {
+    results_table <- rbind(results_table, data.frame(
+      Event = model$event_var, 
+      Model = model$label, 
+      Covariate = model_results$Covariate[row],
+      HR_95CI = model_results$HR_95CI[row],
+      HR_95CI_words = model_results$HR_95CI_words[row]
+      
+    ))
+  }
+}
+
+# Print the results table
+print(results_table)
+
+write.csv(results_table, file = "elsa_1_lead_signal_results.csv", row.names = FALSE)
+
+```
+
+
+```{r}
+
+# Competing risk 
+
+library(cmprsk)
+
+df_elsa$multioutcome <- ifelse(df_elsa$outcome == 1, 1,
+                            ifelse(df_elsa$all_cause_death_old_censor == 1, 2, 0))
+
+df_elsa_predictors_cont <- c("positive_screen","age", "sex")
+
+covariate_matrix <- as.matrix(df_elsa[df_elsa_predictors_cont])
+
+# Fit the Fine-Gray model
+
+fg_model <- crr(ftime = df_elsa$time_to_hf_event_tmp, fstatus = df_elsa$multioutcome, cov1 = covariate_matrix)
+
+summary(fg_model)
+
+
+
+library(cmprsk)
+
+df_elsa$multioutcome <- ifelse(df_elsa$outcome == 1, 1,
+                            ifelse(df_elsa$all_cause_death_old_censor == 1, 2, 0))
+
+df_elsa_predictors_cont <- c("positive_screen","age", "sex", "htn", "t2dm","ihd","obesity")
+
+covariate_matrix <- as.matrix(df_elsa[df_elsa_predictors_cont])
+
+# Fit the Fine-Gray model
+
+fg_model <- crr(ftime = df_elsa$time_to_hf_event_tmp, fstatus = df_elsa$multioutcome, cov1 = covariate_matrix)
+summary(fg_model)
+
+
+############
+# Continuous risk
+
+library(cmprsk)
+
+df_elsa$multioutcome <- ifelse(df_elsa$outcome == 1, 1,
+                            ifelse(df_elsa$all_cause_death_old_censor == 1, 2, 0))
+
+df_elsa_predictors_cont <- c("pred_col_x10","age", "sex")
+
+covariate_matrix <- as.matrix(df_elsa[df_elsa_predictors_cont])
+
+# Fit the Fine-Gray model
+
+fg_model <- crr(ftime = df_elsa$time_to_hf_event_tmp, fstatus = df_elsa$multioutcome, cov1 = covariate_matrix)
+
+summary(fg_model)
+
+
+
+library(cmprsk)
+
+df_elsa$multioutcome <- ifelse(df_elsa$outcome == 1, 1,
+                            ifelse(df_elsa$all_cause_death_old_censor == 1, 2, 0))
+
+df_elsa_predictors_cont <- c("pred_col_x10","age", "sex", "htn", "t2dm","ihd","obesity")
+
+covariate_matrix <- as.matrix(df_elsa[df_elsa_predictors_cont])
+
+# Fit the Fine-Gray model
+
+fg_model <- crr(ftime = df_elsa$time_to_hf_event_tmp, fstatus = df_elsa$multioutcome, cov1 = covariate_matrix)
+summary(fg_model)
+
+
+
+
+```
+
+
+
+```{r}
+library(survminer)
+
+cox_model <- coxph(Surv(Time2Outcome, outcome) ~ age + sex + strata(positive_screen),
+                   data = df_elsa)
+
+hazard_est <- basehaz(cox_model)
+
+hazard_plot_positive_screen <- ggsurvplot(survfit(cox_model),
+                    data = df_elsa, 
+                    fun = "cumhaz", # Specify that you want to plot the cumulative hazard
+           risk.table = TRUE, conf.int = FALSE,
+           ylab="Cumulative Hazard", xlab="Follow-up Time (days)",
+           size=1, risk.table.y.text = FALSE, palette = 
+    c( "#0072B2", "#FF8C00"), ggtheme = theme(
+             axis.text.x = element_text(size=18, vjust = 0.5, colour = "#000000"),
+          axis.text.y = element_text(size=18, vjust = 0.5, colour = "#000000"),
+          axis.title.y = element_text(size=18, face="bold", colour = "#000000"),
+          axis.title.x = element_text(size=18, face="bold", colour = "#000000"),
+             axis.line.x = element_line(colour = "#000000"),
+          axis.line.y = element_line(colour = "#000000"),
+             panel.background = element_rect(fill='transparent'),
+          plot.background = element_rect(fill='transparent', color=NA),
+        
+          legend.title=element_text(size=18),
+          legend.position="bottom",
+          legend.text=element_text(size=18)),
+    title = "Adjusted for Age and Sex"
+            
+           ) 
+
+hazard_plot_positive_screen
+
+
+```
+
+
+```{r}
+
+library(survminer)
+
+cox_model <- coxph(Surv(Time2Outcome, outcome) ~ age + sex + strata(pred_strata_custom),
+                   data = df_elsa)
+
+hazard_est <- basehaz(cox_model)
+
+hazard_plot_custom_strata <- ggsurvplot(survfit(cox_model),
+                    data = df_elsa, 
+                    fun = "cumhaz", # Specify that you want to plot the cumulative hazard
+                      # ylim = c(0, 0.0050),  # Adjust the y-axis limits as needed
+           risk.table = TRUE, conf.int = FALSE,
+           ylab="Cumulative Hazard", xlab="Follow-up Time (days)",
+           size=1, risk.table.y.text = FALSE, palette = 
+    c( "#1FD068", "#FFD700", "#7D0108"), ggtheme = theme(
+             axis.text.x = element_text(size=18, vjust = 0.5, colour = "#000000"),
+          axis.text.y = element_text(size=18, vjust = 0.5, colour = "#000000"),
+          axis.title.y = element_text(size=18, face="bold", colour = "#000000"),
+          axis.title.x = element_text(size=18, face="bold", colour = "#000000"),
+             axis.line.x = element_line(colour = "#000000"),
+          axis.line.y = element_line(colour = "#000000"),
+             panel.background = element_rect(fill='transparent'),
+          plot.background = element_rect(fill='transparent', color=NA),
+        
+          legend.title=element_text(size=18),
+          legend.position="bottom",
+          legend.text=element_text(size=18)),
+    title = "Adjusted for Age and Sex"
+            
+           ) 
+
+hazard_plot_custom_strata
+
+```
+
+
+```{r}
+# Define your categorical variables
+categorical_vars <- c("Age_65_YN", "sex", "race_ethnicity")
+
+# Initialize an empty data frame for results
+results_table <- data.frame(Category = character(), Count_PrimaryHF_1 = numeric(), stringsAsFactors = FALSE)
+
+# Loop through each categorical variable
+for (var in categorical_vars) {
+  unique_values <- unique(df_elsa[[var]])
+  for (value in unique_values) {
+    subgroup_data <- subset(df_elsa, df_elsa[[var]] == value)
+    count_primaryHF_1 <- sum(subgroup_data$hf_event_tmp == 1, na.rm = TRUE)
+    
+    results_table <- rbind(results_table, data.frame(
+      Category = paste(var, value, sep = "_"),
+      Count_PrimaryHF_1 = count_primaryHF_1
+    ))
+  }
+}
+
+# Print the results table
+print(results_table)
+
+
+
+```
+
+
+
+```{r}
+
+
+
+# Adjusted function to handle different subgroups based on categorical variables
+fit_and_extract_subgroups <- function(time_var, event_var, covariate_formula, categorical_vars, data) {
+  results_table <- data.frame(Event = character(), Model = character(), Covariate = character(), HR_95CI = character(), HR_95CI_words = character(), stringsAsFactors = FALSE)
+  
+  for (var in categorical_vars) {
+    unique_values <- unique(data[[var]])
+    for (value in unique_values) {
+      subgroup_data <- subset(data, data[[var]] == value)
+      covariate_formula_with_subgroup <- paste(covariate_formula, collapse = " + ")
+      model_results <- fit_and_extract(time_var, event_var, covariate_formula_with_subgroup, subgroup_data)
+      
+      for (row in 1:nrow(model_results)) {
+        results_table <- rbind(results_table, data.frame(
+          Event = event_var, 
+          Model = paste(var, value, sep = "_"), 
+          Covariate = model_results$Covariate[row],
+          HR_95CI = model_results$HR_95CI[row],
+          HR_95CI_words = model_results$HR_95CI_words[row]
+        ))
+      }
+    }
+  }
+  return(results_table)
+}
+
+# Define your categorical variables
+categorical_vars <- c("Age_65_YN", "sex", "race_ethnicity" )
+
+# Define your models and their corresponding event and time variables
+models <- list(
+    
+    list(event_var = "hf_event_tmp", time_var = "time_to_hf_event_tmp", covariates = c("positive_screen", "age", "sex"), label = "Age + Sex")
+  
+)
+
+# Initialize an empty data frame for results
+results_table <- data.frame(Event = character(), Model = character(),  Covariate = character(), HR_95CI = character(), HR_95CI_words = character(),  stringsAsFactors = FALSE)
+
+# Loop through each model specification and add results to the table
+for (model in models) {
+  model_results <- fit_and_extract_subgroups(model$time_var, model$event_var, model$covariates, categorical_vars, df_elsa)
+  
+  
+  
+  results_table <- rbind(results_table, model_results)
+}
+
+# Print the results table
+print(results_table)
+
+```
+
+
+
+```{r}
+
+require(survival)
+library(rms)
+S <- Surv(df_elsa$time_to_hf_event_tmp, df_elsa$hf_event_tmp)
+
+f <- cph(S ~ df_elsa$pred_col, x=TRUE, y=TRUE, estimates=TRUE, pr=FALSE,
+dxy=TRUE)
+
+# validate(f, B=150, dxy = TRUE)
+
+result <- dxy.cens(df_elsa$pred_col, S, type=c('time','hazard'))
+
+Dxy <- abs(unname(result[1]))
+se <- abs(unname(result[2]))
+
+# Calculate 95% confidence intervals for Somers' D
+Z_95 <- qnorm(0.975)  # Z-score for 95% CI using qnorm for the standard normal distribution
+lower_limit <- Dxy - (Z_95 * se)
+upper_limit <- Dxy + (Z_95 * se)
+
+
+# Convert Somers' D to Harrell's C statistic
+C <- (Dxy + 1) / 2
+C_lower_limit <- (lower_limit + 1) / 2
+C_upper_limit <- (upper_limit + 1) / 2
+
+# Printing Harrell's C statistic and its confidence interval
+
+HarrellC_with_CI <- sprintf("%.3f (%.3f-%.3f)", C, C_lower_limit, C_upper_limit)
+HarrellC_with_CI
+
+```
+
+```{r}
+calculate_HarrellC_CI <- function(validation_output) {
+  # Extract the corrected Dxy and its standard error
+  Dxy_corrected <- validation_output["Dxy", "index.corrected"]
+  se_Dxy <- validation_output["Dxy", "optimism"] / sqrt(validation_output["Dxy", "n"])
+  
+  # Convert Somers' D to Harrell's C statistic
+  C <- (Dxy_corrected + 1) / 2
+  
+  # Standard error of Harrell's C is half the SE of Dxy due to the linear transformation
+  se_C <- se_Dxy / 2
+  
+  # Calculate 95% confidence intervals for Harrell's C
+  Z_95 <- qnorm(0.975)  # Z-score for 95% CI using qnorm for the standard normal distribution
+  lower_limit_C <- C - (Z_95 * se_C)
+  upper_limit_C <- C + (Z_95 * se_C)
+  
+  # Create a list containing the Harrell's C statistic and its confidence interval
+  HarrellC_CI <- list(
+    C = C,
+    lower_limit = lower_limit_C,
+    upper_limit = upper_limit_C
+  )
+  
+  # Returning the result as a formatted string
+  return(sprintf("%.3f (%.3f-%.3f)", HarrellC_CI$C, HarrellC_CI$lower_limit, HarrellC_CI$upper_limit))
+}
+
+```
+
+```{r}
+
+require(survival)
+library(rms)
+S <- Surv(df_elsa$Time2Outcome, df_elsa$outcome)
+
+
+# f <- cph(S ~ pred_col , data = df_elsa, x = TRUE, y = TRUE, estimates = TRUE)
+f <- cph(S ~ pcp_hf_risk_adjusted , data = df_elsa, x = TRUE, y = TRUE, estimates = TRUE)
+# f <- cph(S ~ pred_col + pcp_hf_risk_adjusted , data = df_elsa, x = TRUE, y = TRUE, estimates = TRUE)
+
+val <- validate(f, B=100, method='boot', dxy=TRUE)
+
+
+HarrellC_with_CI <- calculate_HarrellC_CI(val)
+print(HarrellC_with_CI)
+
+```
+
+```{r}
+
+extract_harrells_c <- function(cox_model) {
+  # Extract the concordance index and its standard error
+  concordance <- cox_model$ concordance[1]
+  se_concordance <- cox_model$ concordance[2]
+  
+  # Calculate the 95% CI using the normal approximation
+  lower_ci <- concordance - 1.96 * se_concordance
+  upper_ci <- concordance + 1.96 * se_concordance
+  
+  # Format the output as requested
+  formatted_output <- sprintf("%.3f (%.3f-%.3f)", concordance, lower_ci, upper_ci)
+  
+  return(formatted_output)
+}
+```
+
+
+```{r}
+calculate_c_statistics <- function(output) {
+  # Extract and adjust the C indices
+  c_index_1 <- 1 - output$est.c[1]
+  c_index_2 <- 1 - output$est.c[2]
+  
+  # Calculate 95% CIs for the adjusted C indices
+  ci_c_index_1 <- c(1 - (output$est.c[1] + 1.96 * sqrt(output$est.varCxy)),
+                    1 - (output$est.c[1] - 1.96 * sqrt(output$est.varCxy)))
+  
+  ci_c_index_2 <- c(1 - (output$est.c[2] + 1.96 * sqrt(output$est.varCxz)),
+                    1 - (output$est.c[2] - 1.96 * sqrt(output$est.varCxz)))
+  
+ # Extract the difference in the C indices
+  diff_c_indices <- output$est.diff_c
+  
+  # Calculate the 95% CI for the difference
+  ci_diff_c_indices <- c(diff_c_indices - 1.96 * sqrt(output$est.vardiff_c),
+                         diff_c_indices + 1.96 * sqrt(output$est.vardiff_c))
+  
+  # Extract the p-value for the difference
+  p_value <- output$pval
+  
+  # Return a list containing all the results
+  list(c_index_1 = c_index_1, ci_c_index_1 = ci_c_index_1,
+       c_index_2 = c_index_2, ci_c_index_2 = ci_c_index_2,
+       diff_c_indices = diff_c_indices, ci_diff_c_indices = ci_diff_c_indices,
+       p_value = p_value)
+}
+
+# Assuming 'output' is the list shown in the screenshot
+# result <- calculate_c_statistics(output)
+# print(result)
+
+
+```
+
+```{r}
+library(compareC)
+
+cox_model_pred <- coxph(Surv(Time2Outcome, outcome) ~ pred_col, data = df_elsa)
+summary(cox_model_pred)
+
+
+cox_model_pcp <- coxph(Surv(Time2Outcome, outcome) ~ pcp_hf_risk_adjusted, data = df_elsa)
+summary(cox_model_pcp)
+
+
+cox_model_prevent <- coxph(Surv(Time2Outcome, outcome) ~ prevent_hf_risk_adjusted, data = df_elsa)
+summary(cox_model_prevent)
+
+
+cox_model_pred_age_sex <- coxph(Surv(Time2Outcome, outcome) ~ pred_col + age + sex, data = df_elsa)
+summary(cox_model_pred_age_sex)
+
+
+cox_model_both <- coxph(Surv(Time2Outcome, outcome) ~ pred_col + pcp_hf_risk_adjusted, data = df_elsa)
+summary(cox_model_both)
+
+cox_model_both_ai_prevent <- coxph(Surv(Time2Outcome, outcome) ~ pred_col + prevent_hf_risk_adjusted, data = df_elsa)
+summary(cox_model_both_ai_prevent)
+
+
+df_elsa$hr_pred <- predict(cox_model_pred, type="risk", newdata =df_elsa)
+df_elsa$hr_pcp <- predict(cox_model_pcp, type="risk", newdata =df_elsa)
+df_elsa$hr_prevent <- predict(cox_model_prevent, type="risk", newdata =df_elsa)
+df_elsa$hr_pred_age_sex <- predict(cox_model_pred_age_sex, type="risk", newdata =df_elsa)
+df_elsa$hr_both <- predict(cox_model_both, type="risk", newdata =df_elsa)
+df_elsa$hr_both_ai_prevent <- predict(cox_model_both_ai_prevent, type="risk", newdata =df_elsa)
+
+df_elsa2 <- subset(df_elsa, select = c(age, Time2Outcome, outcome, pred_col, pcp_hf_risk_adjusted, hr_pred, hr_pcp, hr_both, hr_pred_age_sex))
+df_elsa2 <- subset(df_elsa2, age >= 30 & age <= 80)
+df_elsa2 <- df_elsa2[is.finite(rowSums(df_elsa2)), ]  # Remove rows with Inf values
+
+df_elsa3 <- subset(df_elsa, select = c(age, Time2Outcome, outcome, pred_col, prevent_hf_risk_adjusted, hr_pred, hr_prevent, hr_pred_age_sex, hr_both_ai_prevent))
+df_elsa3 <- subset(df_elsa3, age >= 30 & age <= 80)
+df_elsa3 <- df_elsa3[is.finite(rowSums(df_elsa3)), ]  # Remove rows with Inf values
+
+
+
+# PCP
+pred_vs_pcp <- compareC(df_elsa2$Time2Outcome, df_elsa2$outcome, df_elsa2$hr_pred, df_elsa2$hr_pcp)
+calculate_c_statistics(pred_vs_pcp)
+
+
+pred_age_sex_vs_pcp <- compareC(df_elsa2$Time2Outcome, df_elsa2$outcome, df_elsa2$hr_pred_age_sex, df_elsa2$hr_pcp)
+calculate_c_statistics(pred_age_sex_vs_pcp)
+
+
+both_vs_pcp <- compareC(df_elsa2$Time2Outcome, df_elsa2$outcome, df_elsa2$hr_both, df_elsa2$hr_pcp)
+calculate_c_statistics(both_vs_pcp)
+
+
+# PREVENT
+pred_vs_prevent <- compareC(df_elsa3$Time2Outcome, df_elsa3$outcome, df_elsa3$hr_pred, df_elsa3$hr_prevent)
+calculate_c_statistics(pred_vs_prevent)
+
+pred_age_sex_vs_prevent <- compareC(df_elsa3$Time2Outcome, df_elsa3$outcome, df_elsa3$hr_pred_age_sex, df_elsa3$hr_prevent)
+calculate_c_statistics(pred_age_sex_vs_prevent)
+
+both_vs_prevent <- compareC(df_elsa3$Time2Outcome, df_elsa3$outcome, df_elsa3$hr_both_ai_prevent, df_elsa3$hr_prevent)
+calculate_c_statistics(both_vs_prevent)
+
+
+
+```
+
+
+
+
+
+```{r}
+# Adjusted function to handle different subgroups based on categorical variables
+fit_and_extract_subgroups <- function(time_var, event_var, covariate_formula, categorical_vars, data) {
+  results_table <- data.frame(Event = character(), Model = character(), Covariate = character(), HR_95CI = character(), HR_95CI_words = character(), stringsAsFactors = FALSE)
+  
+  for (var in categorical_vars) {
+    unique_values <- unique(data[[var]])
+    for (value in unique_values) {
+      subgroup_data <- subset(data, data[[var]] == value || is.na(data[[var]]))
+
+      # Check if any categorical variable has less than two levels after subsetting
+      skip_subgroup <- any(sapply(subgroup_data[, categorical_vars, drop = FALSE], function(x) is.factor(x) && length(unique(na.omit(x))) < 2))
+      
+      # Skip this subgroup if any categorical variable does not have at least two levels
+      if(skip_subgroup) {
+        next
+      }
+      
+      covariate_formula_with_subgroup <- paste(covariate_formula, collapse = " + ")
+      model_results <- fit_and_extract(time_var, event_var, covariate_formula_with_subgroup, subgroup_data)
+      
+      for (row in 1:nrow(model_results)) {
+        results_table <- rbind(results_table, data.frame(
+          Event = event_var, 
+          Model = paste(var, value, sep = "_"), 
+          Covariate = model_results$Covariate[row],
+          HR_95CI = model_results$HR_95CI[row],
+          HR_95CI_words = model_results$HR_95CI_words[row]
+        ))
+      }
+    }
+  }
+  return(results_table)
+}
+
+# Define your categorical variables
+categorical_vars <- c("Age_65_YN", "sex" )
+
+# Define your models and their corresponding event and time variables
+models <- list(
+    list(event_var = "hf_event_tmp", time_var = "time_to_hf_event_tmp", covariates = c("positive_screen", "age", "sex"), label = "Age + Sex")
+)
+
+# Initialize an empty data frame for results
+results_table <- data.frame(Event = character(), Model = character(),  Covariate = character(), HR_95CI = character(), HR_95CI_words = character(),  stringsAsFactors = FALSE)
+
+# Loop through each model specification and add results to the table
+for (model in models) {
+  model_results <- fit_and_extract_subgroups(model$time_var, model$event_var, model$covariates, categorical_vars, df_elsa)
+  if(nrow(model_results) > 0) {
+    results_table <- rbind(results_table, model_results)
+  } else {
+    warning(paste("No results for model with event_var:", model$event_var, "and time_var:", model$time_var))
+  }
+}
+
+# Print the results table
+print(results_table)
+
+
+```
+
+
+```{r}
+
+
+library(survminer)
+library(survival)
+
+
+cox_model <- coxph(Surv(Time2Outcome, outcome) ~ age + sex + strata(pred_strata_custom),
+                   data = df_elsa)
+
+hazard_est <- basehaz(cox_model)
+
+hazard_plot_custom_strata <- ggsurvplot(survfit(cox_model),
+                    data = df_elsa, 
+                    fun = "cumhaz", # Specify that you want to plot the cumulative hazard
+                    risk.table = FALSE, # Do not show the risk table
+                    conf.int = FALSE,
+                    ylab="Cumulative Hazard", xlab="Follow-up Time (days)",
+                    size=1, risk.table.y.text = FALSE, 
+                    palette = c("#1FD068", "#FFD700", "#7D0108"), 
+                    legend = 'none', # Do not show the legend
+                    ggtheme = theme(
+                      axis.text.x = element_text(size=18, vjust = 0.5, colour = "#FFFFFF"),
+                      axis.text.y = element_text(size=18, vjust = 0.5, colour = "#FFFFFF"),
+                      axis.title.y = element_text(size=18, face="bold", colour = "#FFFFFF"),
+                      axis.title.x = element_text(size=18, face="bold", colour = "#FFFFFF"),
+                      axis.line.x = element_line(colour = "#FFFFFF"),
+                      axis.line.y = element_line(colour = "#FFFFFF"),
+                      panel.background = element_rect(fill='#000000'),
+                      plot.background = element_rect(fill='#000000', color=NA),
+                      panel.grid.major = element_blank(), # Remove major grid lines
+                      panel.grid.minor = element_blank()  # Remove minor grid lines
+                    ),
+                    title = "Adjusted for Age and Sex"
+           )
+
+hazard_plot_custom_strata
+
+```
+
+
+```{r}
+
+library(survminer)
+library(survival)
+
+cox_model <- coxph(Surv(Time2Outcome, outcome) ~ pcp_hf_risk_adjusted + strata(positive_screen), data = df_elsa)
+
+hazard_plot_positive_screen <- ggsurvplot(survfit(cox_model),
+                    data = df_elsa, 
+                    fun = "cumhaz", # Specify that you want to plot the cumulative hazard
+                    risk.table = FALSE, # Do not show the risk table
+                    conf.int = FALSE,
+                    ylab="Cumulative Hazard", xlab="Follow-up Time (days)",
+                    size=1, risk.table.y.text = FALSE, 
+                    palette = c("#0072B2", "#FF8C00"),
+                    legend = 'none', # Do not show the legend
+                    # ylim = c(0, 0.025), # Customize the y-axis limits here
+                    ggtheme = theme(
+                      axis.text.x = element_text(size=18, vjust = 0.5, colour = "#FFFFFF"),
+                      axis.text.y = element_text(size=18, vjust = 0.5, colour = "#FFFFFF"),
+                      axis.title.y = element_text(size=18, face="bold", colour = "#FFFFFF"),
+                      axis.title.x = element_text(size=18, face="bold", colour = "#FFFFFF"),
+                      axis.line.x = element_line(colour = "#FFFFFF"),
+                      axis.line.y = element_line(colour = "#FFFFFF"),
+                      panel.background = element_rect(fill='#000000'),
+                      plot.background = element_rect(fill='#000000', color=NA),
+                      panel.grid.major = element_blank(), # Remove major grid lines
+                      panel.grid.minor = element_blank()  # Remove minor grid lines
+                    ),
+                    title = "Adjusted for PCP-HF Score"
+           )
+
+hazard_plot_positive_screen
+
+df_elsa$pcp_hf_risk_adjusted_x10 = df_elsa$pcp_hf_risk_adjusted*10
+
+model <- coxph(Surv(Time2Outcome, outcome) ~ positive_screen + pcp_hf_risk_adjusted_x10,
+                   data = df_elsa)
+summary(model)
+
+
+
+
+```
+
+```{r}
+
+library(survminer)
+library(survival)
+
+cox_model <- coxph(Surv(Time2Outcome, outcome) ~ pcp_hf_risk_adjusted + strata(positive_screen), data = df_elsa)
+
+hazard_plot_positive_screen <- ggsurvplot(survfit(cox_model),
+                    data = df_elsa, 
+                    fun = "cumhaz", # Specify that you want to plot the cumulative hazard
+                    risk.table = FALSE, # Do not show the risk table
+                    conf.int = FALSE,
+                    ylab="Cumulative Hazard", xlab="Follow-up Time (days)",
+                    size=1, risk.table.y.text = FALSE, 
+                    palette = c("#0072B2", "#FF8C00"),
+                    legend = 'none', # Do not show the legend
+                    # ylim = c(0, 0.025), # Customize the y-axis limits here
+                    ggtheme = theme(
+                      axis.text.x = element_text(size=18, vjust = 0.5, colour = "#FFFFFF"),
+                      axis.text.y = element_text(size=18, vjust = 0.5, colour = "#FFFFFF"),
+                      axis.title.y = element_text(size=18, face="bold", colour = "#FFFFFF"),
+                      axis.title.x = element_text(size=18, face="bold", colour = "#FFFFFF"),
+                      axis.line.x = element_line(colour = "#FFFFFF"),
+                      axis.line.y = element_line(colour = "#FFFFFF"),
+                      panel.background = element_rect(fill='#000000'),
+                      plot.background = element_rect(fill='#000000', color=NA),
+                      panel.grid.major = element_blank(), # Remove major grid lines
+                      panel.grid.minor = element_blank()  # Remove minor grid lines
+                    ),
+                    title = "Adjusted for PCP-HF Score"
+           )
+
+
+
+model <- coxph(Surv(Time2Outcome, outcome) ~ positive_screen + pcp_hf_risk_adjusted,
+                   data = df_elsa)
+
+hazard_plot_positive_screen
+
+summary(model)
+
+
+
+
+```
+
+
+
+```{r}
+
+library(survminer)
+
+cox_model <- coxph(Surv(Time2Outcome, outcome) ~ age + sex + strata(pred_strata_custom),
+                   data = df_elsa)
+
+hazard_est <- basehaz(cox_model)
+
+hazard_plot_custom_strata <- ggsurvplot(survfit(cox_model),
+                    data = df_elsa, 
+                    fun = "cumhaz", # Specify that you want to plot the cumulative hazard
+                      # ylim = c(0, 0.0050),  # Adjust the y-axis limits as needed
+           risk.table = FALSE, conf.int = FALSE,
+           ylab="Cumulative Hazard", xlab="Follow-up Time (days)",
+           size=1, risk.table.y.text = FALSE, palette = 
+    c( "#1FD068", "#FFD700", "#7D0108"), legend = 'none', # Do not show the legend,
+    ggtheme = theme(
+          axis.text.x = element_text(size=18, vjust = 0.5, colour = "#000000"),
+          axis.text.y = element_text(size=18, vjust = 0.5, colour = "#000000"),
+          axis.title.y = element_text(size=18, face="bold", colour = "#000000"),
+          axis.title.x = element_text(size=18, face="bold", colour = "#000000"),
+          axis.line.x = element_line(colour = "#000000"),
+          axis.line.y = element_line(colour = "#000000"),
+          panel.background = element_rect(fill='transparent'),
+          plot.background = element_rect(fill='transparent', color=NA),
+          panel.grid.major = element_blank(), # Remove major grid lines
+          panel.grid.minor = element_blank()  # Remove minor grid lines
+                  
+           ) )
+
+hazard_plot_custom_strata
+
+
+```
+
+
+```{r}
+library(survminer)
+
+cox_model <- coxph(Surv(Time2Outcome, outcome) ~ strata (positive_screen) + pcp_hf_risk_adjusted,
+                   data = df_elsa)
+
+hazard_est <- basehaz(cox_model)
+
+hazard_plot_positive_screen <- ggsurvplot(survfit(cox_model),
+                    data = df_elsa, 
+                    fun = "cumhaz", # Specify that you want to plot the cumulative hazard
+           risk.table = TRUE, conf.int = FALSE,
+           ylab="Cumulative Hazard", xlab="Follow-up Time (days)",
+           size=1, risk.table.y.text = FALSE, palette = 
+    c( "#0072B2", "#FF8C00"), ggtheme = theme(
+             axis.text.x = element_text(size=18, vjust = 0.5, colour = "#000000"),
+          axis.text.y = element_text(size=18, vjust = 0.5, colour = "#000000"),
+          axis.title.y = element_text(size=18, face="bold", colour = "#000000"),
+          axis.title.x = element_text(size=18, face="bold", colour = "#000000"),
+             axis.line.x = element_line(colour = "#000000"),
+          axis.line.y = element_line(colour = "#000000"),
+             panel.background = element_rect(fill='transparent'),
+          plot.background = element_rect(fill='transparent', color=NA),
+        
+          legend.title=element_text(size=18),
+          legend.position="bottom",
+          legend.text=element_text(size=18)),
+    title = "Adjusted for Age and Sex"
+            
+           ) 
+
+model <- coxph(Surv(Time2Outcome, outcome) ~ positive_screen + pcp_hf_risk_adjusted,
+                   data = df_elsa)
+
+hazard_plot_positive_screen
+
+summary(model)
+
+
+
+```
+
+```{r}
+# IDI
+library(boot)
+
+# Function to calculate IDI
+calculate_idi <- function(outcome, prob1, prob2) {
+  mean_prob1_events <- mean(prob1[outcome == 1])
+  mean_prob1_non_events <- mean(prob1[outcome == 0])
+  mean_prob2_events <- mean(prob2[outcome == 1])
+  mean_prob2_non_events <- mean(prob2[outcome == 0])
+  idi <- (mean_prob2_events - mean_prob1_events) - (mean_prob2_non_events - mean_prob1_non_events)
+  return(idi)
+}
+
+# Function to perform bootstrap for IDI and calculate CI
+idi_bootstrap <- function(data, outcome_col, model1_col, model2_col, R = 1000) {
+  # Extract relevant data
+  outcomes <- data[[outcome_col]]
+  model1_probs <- data[[model1_col]]
+  model2_probs <- data[[model2_col]]
+  
+  # Calculate IDI for the entire dataset
+  initial_idi <- calculate_idi(outcomes, model1_probs, model2_probs)
+  
+  # Bootstrap function for confidence intervals
+  boot_func <- function(data, indices) {
+    d <- data[indices, ]
+    idi_value <- calculate_idi(d[[outcome_col]], d[[model1_col]], d[[model2_col]])
+    return(idi_value)
+  }
+
+  # Perform the bootstrap
+  results <- boot(data, statistic = boot_func, R = R)
+  
+  # Calculate 95% CI using the 'bca' method
+  idi_ci <- boot.ci(results, type = "perc")
+  
+  # Return both IDI and CI
+  list(IDI = initial_idi, CI = idi_ci)
+}
+
+
+calculate_idi(df_elsa2$outcome, df_elsa2$pcp_hf_risk_adjusted, df_elsa2$pred_col)
+idi_bootstrap(df_elsa2, "outcome", "pcp_hf_risk_adjusted", "pred_col", R = 1000)
+
+
+
+calculate_idi(df_elsa3$outcome, df_elsa3$prevent_hf_risk_adjusted, df_elsa3$pred_col)
+idi_bootstrap(df_elsa3, "outcome", "prevent_hf_risk_adjusted", "pred_col", R = 1000)
+
+
+# NRI
+library(nricens)
+
+# NRI time-to-event
+set.seed(1)
+nricens(time = df_elsa3$Time2Outcome, event = df_elsa3$outcome,
+        p.std = df_elsa3$prevent_hf_risk_adjusted, p.new = df_elsa3$pred_col, t0 = median(df_elsa3$Time2Outcome),
+updown = "category", cut = 0.08,
+niter = 1000, alpha = 0.05, msg = TRUE)
+
+set.seed(1)
+nricens(time = df_elsa3$Time2Outcome, event = df_elsa3$outcome,
+        p.std = df_elsa3$prevent_hf_risk_adjusted, p.new = df_elsa3$pred_col,
+updown = "diff", cut = 0, t0 = median(df_elsa3$Time2Outcome),
+niter = 1000, alpha = 0.05, msg = TRUE)
+
+
+# Censored performance metric
+library(timeROC)
+output <- SeSpPPVNPV(cutpoint=0.08,
+                     T=df_elsa3$Time2Outcome,
+                     delta=df_elsa3$outcome,
+                     marker=df_elsa3$pred_col,
+                     cause=1,
+                     times=median(df_elsa3$Time2Outcome),
+                     iid = TRUE)
+
+print("AI-ECG")
+# Sen
+paste0(round(output$TP[[2]]*100, 1), "% (", round((output$TP[[2]] - 1.96*output$inference$vect_se_Se[[2]])*100, 1), "-", round((output$TP[[2]] + 1.96*output$inference$vect_se_Se[[2]])*100, 1), ")")
+# Spe
+paste0(round(output$FP[[2]]*100, 1), "% (", round((output$FP[[2]] - 1.96*output$inference$vect_se_Sp1[[2]])*100, 1), "-", round((output$FP[[2]] + 1.96*output$inference$vect_se_Sp1[[2]])*100, 1), ")")
+# PPV
+paste0(round(output$PPV[[2]]*100, 1), "% (", round((output$PPV[[2]] - 1.96*output$inference$vect_se_PPV[[2]])*100, 1), "-", round((output$PPV[[2]] + 1.96*output$inference$vect_se_PPV[[2]])*100, 1), ")")
+# NPV
+paste0(round(output$NPV[[2]]*100, 1), "% (", round((output$NPV[[2]] - 1.96*output$inference$vect_se_NPV1[[2]])*100, 1), "-", round((output$NPV[[2]] + 1.96*output$inference$vect_se_NPV1[[2]])*100, 1), ")")
+
+
+print("PCP-HF")
+output <- SeSpPPVNPV(cutpoint=0.08,
+                     T=df_elsa2$Time2Outcome,
+                     delta=df_elsa2$outcome,
+                     marker=df_elsa2$pcp_hf_risk_adjusted,
+                     cause=1,
+                     times=median(df_elsa2$Time2Outcome),
+                     iid = TRUE)
+# Sen
+paste0(round(output$TP[[2]]*100, 1), "% (", round((output$TP[[2]] - 1.96*output$inference$vect_se_Se[[2]])*100, 1), "-", round((output$TP[[2]] + 1.96*output$inference$vect_se_Se[[2]])*100, 1), ")")
+# Spe
+paste0(round(output$FP[[2]]*100, 1), "% (", round((output$FP[[2]] - 1.96*output$inference$vect_se_Sp1[[2]])*100, 1), "-", round((output$FP[[2]] + 1.96*output$inference$vect_se_Sp1[[2]])*100, 1), ")")
+# PPV
+paste0(round(output$PPV[[2]]*100, 1), "% (", round((output$PPV[[2]] - 1.96*output$inference$vect_se_PPV[[2]])*100, 1), "-", round((output$PPV[[2]] + 1.96*output$inference$vect_se_PPV[[2]])*100, 1), ")")
+# NPV
+paste0(round(output$NPV[[2]]*100, 1), "% (", round((output$NPV[[2]] - 1.96*output$inference$vect_se_NPV1[[2]])*100, 1), "-", round((output$NPV[[2]] + 1.96*output$inference$vect_se_NPV1[[2]])*100, 1), ")")
+
+
+print("PREVENT-HF")
+output <- SeSpPPVNPV(cutpoint=0.08,
+                     T=df_elsa3$Time2Outcome,
+                     delta=df_elsa3$outcome,
+                     marker=df_elsa3$prevent_hf_risk_adjusted,
+                     cause=1,
+                     times=median(df_elsa3$Time2Outcome),
+                     iid = TRUE)
+# Sen
+paste0(round(output$TP[[2]]*100, 1), "% (", round((output$TP[[2]] - 1.96*output$inference$vect_se_Se[[2]])*100, 1), "-", round((output$TP[[2]] + 1.96*output$inference$vect_se_Se[[2]])*100, 1), ")")
+# Spe
+paste0(round(output$FP[[2]]*100, 1), "% (", round((output$FP[[2]] - 1.96*output$inference$vect_se_Sp1[[2]])*100, 1), "-", round((output$FP[[2]] + 1.96*output$inference$vect_se_Sp1[[2]])*100, 1), ")")
+# PPV
+paste0(round(output$PPV[[2]]*100, 1), "% (", round((output$PPV[[2]] - 1.96*output$inference$vect_se_PPV[[2]])*100, 1), "-", round((output$PPV[[2]] + 1.96*output$inference$vect_se_PPV[[2]])*100, 1), ")")
+# NPV
+paste0(round(output$NPV[[2]]*100, 1), "% (", round((output$NPV[[2]] - 1.96*output$inference$vect_se_NPV1[[2]])*100, 1), "-", round((output$NPV[[2]] + 1.96*output$inference$vect_se_NPV1[[2]])*100, 1), ")")
+
+```
